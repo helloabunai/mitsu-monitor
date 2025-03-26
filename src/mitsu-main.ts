@@ -61,42 +61,57 @@ class AirConditioner {
 
 // Monitor units via melcould-control REST API
 class AirConditionerMonitor {
-    private airConditioners: AirConditioner[];
-    constructor(airConditioners: AirConditioner[]) {
-        this.airConditioners = airConditioners;
+    private airConditioner: AirConditioner;
+
+    constructor(airConditioner: AirConditioner) {
+        this.airConditioner = airConditioner;
     }
 
     startMonitoring(interval: number): void {
         setInterval(async () => {
-            for (const ac of this.airConditioners) {
-                let currState: HeatPumpState = {} as HeatPumpState;
-    
-                try {
-                    currState = await ac.getState();
-                } catch (error) {
-                    console.error(`Error monitoring AC at ${ac.ipAddress}:${ac.port}:`, error);
-                }
+            let currState: HeatPumpState = {} as HeatPumpState;
+            const dryingTime: number = parseInt(process.env.TARGET_DRY_TIME_MS!);
 
-                console.log(`\n\nCurrent state of AC at ${ac.ipAddress}:${ac.port}`);
-                console.log(`operationMode: `, currState.OperationMode);
-                console.log(`RoomTemperature: `, currState.RoomTemperature);
-                console.log(`OutdoorTemperature: `, currState.OutdoorTemperature);
-                console.log(`FanSpeed: `, currState.FanSpeed);
-                console.log(`ActualFanSpeed: `, currState.ActualFanSpeed);
-    
-                // do things based on currState here.
+            try {
+                currState = await this.airConditioner.getState();
+            } catch (error) {
+                console.error(`Error monitoring AC at ${this.airConditioner.ipAddress}:${this.airConditioner.port}:`, error);
             }
+
+            console.log(`\n\nCurrent state of AC at ${this.airConditioner.ipAddress}:${this.airConditioner.port}`);
+            console.log(`operationMode: `, currState.OperationMode);
+            console.log(`RoomTemperature: `, currState.RoomTemperature);
+            console.log(`OutdoorTemperature: `, currState.OutdoorTemperature);
+            console.log(`FanSpeed: `, currState.FanSpeed);
+            console.log(`ActualFanSpeed: `, currState.ActualFanSpeed);
+
+            // do things based on currState here.
+            // monitor attribute Power going from true to false, when operationMode is 3 (COOL)
+            // when that happens
+            //      set power to true
+            //      set operationMode to 7
+            //      wait process.env.DRY_TIME minutes
+            //      set operationMode to 3
+            //      set power to false
+
+            console.log(">> do logic here.");
+            console.log(">> Target DRY time: ", dryingTime);
+
+
         }, interval);
     }
-    
 }
 
-// connection details
+// environment details
 const homebridgeServer: string = process.env.HOMEBRIDGE_ADDRESS!;
 const downstairsPort: number = parseInt(process.env.DOWNSTAIRS_PORT!);
 const upstairsPort: number = parseInt(process.env.UPSTAIRS_PORT!);
-// create monitors
+// create monitor; downstairs
 const downstairsAC = new AirConditioner(homebridgeServer, downstairsPort, "downstairsAC");
+const downstairsMonitor = new AirConditionerMonitor(downstairsAC);
+downstairsMonitor.startMonitoring(15000); // change this to something longer when done developing
+// create monitor; upstairs
 const upstairsAC = new AirConditioner(homebridgeServer, upstairsPort, "upstairsAC");
-const monitor = new AirConditionerMonitor([downstairsAC, upstairsAC]);
-monitor.startMonitoring(15000); // change this to something longer when done developing
+const upstairsMonitor = new AirConditionerMonitor(upstairsAC);
+upstairsMonitor.startMonitoring(15000); // change this to something longer when done developing
+
