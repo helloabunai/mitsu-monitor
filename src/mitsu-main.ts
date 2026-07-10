@@ -14,7 +14,7 @@ import * as fs from 'fs';
 import * as dotenv from 'dotenv';
 
 import { AirConditioner } from './airConditioner';
-import { loadConfig } from './config';
+import { AppConfig, loadConfig } from './config';
 import { AirConditionerMonitor } from './monitor';
 
 // Prefer a local override file if present, otherwise fall back to process env / .env.
@@ -25,7 +25,7 @@ if (fs.existsSync('.env.local')) {
 }
 
 function main(): void {
-    let config;
+    let config: AppConfig;
     try {
         config = loadConfig();
     } catch (error) {
@@ -36,7 +36,7 @@ function main(): void {
 
     console.log(`mitsu-monitor starting: ${config.devices.length} device(s) on ${config.host}`);
 
-    for (const device of config.devices) {
+    const monitors = config.devices.map((device) => {
         const ac = new AirConditioner({
             label: device.label,
             host: config.host,
@@ -44,8 +44,24 @@ function main(): void {
             statePath: config.statePath,
             dryRun: config.dryRun,
         });
-        new AirConditionerMonitor(ac, config).start();
-    }
+        const monitor = new AirConditionerMonitor(ac, config);
+        monitor.start();
+        return monitor;
+    });
+
+    // Finalize any in-flight dry cycle on exit so we never leave a unit parked in FAN.
+    let shuttingDown = false;
+    const shutdown = async (signal: string): Promise<void> => {
+        if (shuttingDown) {
+            return;
+        }
+        shuttingDown = true;
+        console.log(`Received ${signal} — shutting down ${monitors.length} monitor(s)...`);
+        await Promise.allSettled(monitors.map((m) => m.shutdown()));
+        process.exit(0);
+    };
+    process.on('SIGINT', () => void shutdown('SIGINT'));
+    process.on('SIGTERM', () => void shutdown('SIGTERM'));
 }
 
 main();

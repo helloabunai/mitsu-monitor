@@ -23,6 +23,11 @@ type Phase = 'MONITORING' | 'DRYING';
 
 type DryReason = 'post-off' | 'periodic';
 
+// A single flaky /state read (MELCloud serves cached state) must not be mistaken for a
+// user takeover. Require this many *consecutive* non-FAN reads, after we've confirmed FAN,
+// before we relinquish control.
+const RELINQUISH_AFTER_MISSED = 2;
+
 interface DryCycle {
     reason: DryReason;
     startedAt: number;
@@ -31,6 +36,8 @@ interface DryCycle {
     restoreMode: number;
     // Set true once the device has confirmed it is actually in FAN mode.
     confirmed: boolean;
+    // Consecutive non-FAN reads observed since FAN was last confirmed (debounces flaky reads).
+    missedFan: number;
 }
 
 interface Snapshot {
@@ -49,6 +56,12 @@ export class AirConditionerMonitor {
     private coolRunStartAt: number | null = null;
     private dry: DryCycle | null = null;
 
+    // Re-entrancy guard: a tick's I/O can outlast the poll interval, and setInterval does not
+    // wait for the previous callback. Without this, overlapping ticks could double-fire commands.
+    private ticking = false;
+    private stopped = false;
+    private timer: ReturnType<typeof setInterval> | null = null;
+
     private readonly postOffEnabled: boolean;
     private readonly periodicEnabled: boolean;
 
@@ -66,29 +79,57 @@ export class AirConditionerMonitor {
         );
         // Fire immediately, then on the configured interval.
         void this.tick();
-        setInterval(() => void this.tick(), this.config.pollIntervalMs);
+        this.timer = setInterval(() => void this.tick(), this.config.pollIntervalMs);
+    }
+
+    // Stops polling and, if a dry cycle is in flight, finalizes it so we never leave a unit
+    // parked in FAN when the process is asked to exit (e.g. `docker stop` -> SIGTERM).
+    async shutdown(): Promise<void> {
+        this.stopped = true;
+        if (this.timer !== null) {
+            clearInterval(this.timer);
+            this.timer = null;
+        }
+        if (this.phase === 'DRYING' && this.dry !== null) {
+            const cycle = this.dry;
+            console.log(`[${this.ac.label}] shutting down mid dry-cycle — finalizing.`);
+            if (cycle.reason === 'post-off') {
+                await this.ac.apply({ Power: false });
+            } else {
+                await this.ac.apply({ OperationMode: cycle.restoreMode });
+            }
+        }
     }
 
     private async tick(): Promise<void> {
-        const now = Date.now();
-        const state = await this.ac.getState();
-        if (state === null) {
-            // Transient failure: hold all state (don't advance `prev`, or we'd miss/fake a transition).
+        // Skip this beat if the previous tick is still running, or we're shutting down.
+        if (this.ticking || this.stopped) {
             return;
         }
+        this.ticking = true;
+        try {
+            const now = Date.now();
+            const state = await this.ac.getState();
+            if (state === null) {
+                // Transient failure: hold all state (don't advance `prev`, or we'd miss/fake a transition).
+                return;
+            }
 
-        const snap: Snapshot = { power: state.Power, mode: state.OperationMode };
-        const inCoolDry = snap.power && isCoolOrDry(snap.mode);
+            const snap: Snapshot = { power: state.Power, mode: state.OperationMode };
+            const inCoolDry = snap.power && isCoolOrDry(snap.mode);
 
-        console.log(
-            `[${this.ac.label}] phase=${this.phase} power=${snap.power} ` +
-                `mode=${OperationMode[snap.mode] ?? snap.mode} room=${state.RoomTemperature} outdoor=${state.OutdoorTemperature}`,
-        );
+            console.log(
+                `[${this.ac.label}] phase=${this.phase} power=${snap.power} ` +
+                    `mode=${OperationMode[snap.mode] ?? snap.mode} room=${state.RoomTemperature} outdoor=${state.OutdoorTemperature}`,
+            );
 
-        if (this.phase === 'DRYING') {
-            await this.tickDrying(now, snap);
-        } else {
-            await this.tickMonitoring(now, snap, inCoolDry);
+            if (this.phase === 'DRYING') {
+                await this.tickDrying(now, snap);
+            } else {
+                await this.tickMonitoring(now, snap, inCoolDry);
+            }
+        } finally {
+            this.ticking = false;
         }
     }
 
@@ -101,11 +142,16 @@ export class AirConditionerMonitor {
         if (!this.config.dryRun) {
             if (inFan) {
                 cycle.confirmed = true;
+                cycle.missedFan = 0;
             } else if (cycle.confirmed) {
-                // We had FAN, and now we don't: the user (or something else) took over. Back off.
-                console.log(`[${this.ac.label}] user intervened during dry cycle — relinquishing control.`);
-                this.endDryCycle(now, snap);
-                return;
+                // We had FAN and now we don't. Tolerate a flaky read or two before concluding the
+                // user (or something else) took over; only relinquish after it persists.
+                cycle.missedFan += 1;
+                if (cycle.missedFan >= RELINQUISH_AFTER_MISSED) {
+                    console.log(`[${this.ac.label}] user intervened during dry cycle — relinquishing control.`);
+                    this.endDryCycle(now, snap);
+                    return;
+                }
             } else if (now - cycle.startedAt > this.settleGraceMs()) {
                 // Our command never took effect. Give up rather than hang in DRYING forever.
                 console.warn(`[${this.ac.label}] device never entered FAN mode — aborting dry cycle.`);
@@ -115,12 +161,19 @@ export class AirConditionerMonitor {
         }
 
         if (now >= cycle.endAt) {
+            // Only leave DRYING once the completion command actually lands; otherwise a failed POST
+            // would strand the unit in FAN. Stay put and retry on the next tick.
+            let ok: boolean;
             if (cycle.reason === 'post-off') {
-                console.log(`[${this.ac.label}] dry cycle complete → powering off.`);
-                await this.ac.apply({ Power: false });
+                ok = await this.ac.apply({ Power: false });
+                if (ok) console.log(`[${this.ac.label}] dry cycle complete → powered off.`);
             } else {
-                console.log(`[${this.ac.label}] dry cycle complete → resuming ${OperationMode[cycle.restoreMode] ?? cycle.restoreMode}.`);
-                await this.ac.apply({ OperationMode: cycle.restoreMode });
+                ok = await this.ac.apply({ OperationMode: cycle.restoreMode });
+                if (ok) console.log(`[${this.ac.label}] dry cycle complete → resumed ${OperationMode[cycle.restoreMode] ?? cycle.restoreMode}.`);
+            }
+            if (!ok) {
+                console.warn(`[${this.ac.label}] dry cycle completion command failed — retrying next tick.`);
+                return;
             }
             this.endDryCycle(now, snap);
         }
@@ -171,7 +224,13 @@ export class AirConditionerMonitor {
         command: { Power?: boolean; OperationMode: number },
     ): Promise<void> {
         const payload = this.config.fanSpeed !== undefined ? { ...command, FanSpeed: this.config.fanSpeed } : command;
-        await this.ac.apply(payload);
+        const ok = await this.ac.apply(payload);
+        if (!ok) {
+            // Don't enter DRYING on a command we couldn't send. Leaving `prev`/`coolRunStartAt`
+            // untouched means the same trigger re-fires next tick, so the start naturally retries.
+            console.warn(`[${this.ac.label}] failed to start ${reason} dry cycle — retrying next tick.`);
+            return;
+        }
         this.phase = 'DRYING';
         this.coolRunStartAt = null;
         this.dry = {
@@ -180,6 +239,7 @@ export class AirConditionerMonitor {
             endAt: now + this.config.fanDryDurationMs,
             restoreMode,
             confirmed: false,
+            missedFan: 0,
         };
         // Record what we just asked for so the next tick doesn't read this as a fresh user action.
         this.prev = { power: true, mode: OperationMode.Fan };

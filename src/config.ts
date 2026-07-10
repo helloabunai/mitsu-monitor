@@ -99,6 +99,20 @@ function parseDevices(): DeviceConfig[] {
         if (devices.length === 0) {
             throw new Error('MONITOR_DEVICES was set but no valid devices could be parsed');
         }
+        // Reject collisions: duplicate labels make logs ambiguous, and duplicate ports mean two
+        // monitors would fight over the same physical unit.
+        const seenLabels = new Set<string>();
+        const seenPorts = new Set<number>();
+        for (const { label, port } of devices) {
+            if (seenLabels.has(label)) {
+                throw new Error(`Duplicate device label "${label}" in MONITOR_DEVICES`);
+            }
+            if (seenPorts.has(port)) {
+                throw new Error(`Duplicate device port ${port} in MONITOR_DEVICES`);
+            }
+            seenLabels.add(label);
+            seenPorts.add(port);
+        }
         return devices;
     }
 

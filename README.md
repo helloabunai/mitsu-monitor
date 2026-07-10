@@ -67,6 +67,8 @@ All configuration is via environment variables (see `.env.example`):
 | `FAN_SPEED` | no | (untouched) | Fixed fan speed during the dry cycle (0=Auto, 1-6) |
 | `DRY_RUN` | no | `false` | Log the actions that *would* be taken without POSTing |
 
+> **Note:** `DRY_RUN` must be `false` (or unset) for the monitor to actually drive the units. When `true` it only logs state changes, doesn't send actual API reqs. Used for testing.
+
 ### Basic docker instructions: 
 
 ```
@@ -81,6 +83,31 @@ docker build --no-cache -t helloabunai/mitsu-monitor .
 # Config is passed in at runtime (not baked into the image):
 docker run -d --name mitsu-monitor --restart unless-stopped --env-file .env.local helloabunai/mitsu-monitor:latest
 docker logs -f mitsu-monitor
+```
+
+### Rebuilding on a Synology NAS
+
+I run stuff on an old synology box. Rebuilding process is fairly standard. Synology container manager needs root.
+
+```
+ssh user@synology
+cd /path/to/mitsu-monitor          # wherever you rsync'd or cloned it
+
+# 1. Rebuild the image from the new source
+sudo docker build --no-cache -t helloabunai/mitsu-monitor .
+
+# 2. Replace the running container
+sudo docker stop mitsu-monitor
+sudo docker rm mitsu-monitor
+
+# 3. Start the new one (config still comes in at runtime, not baked into the image)
+sudo docker run -d --name mitsu-monitor \
+  --restart unless-stopped \
+  --env-file .env.local \
+  helloabunai/mitsu-monitor:latest
+
+# 4. Confirm it came up cleanly
+sudo docker logs -f mitsu-monitor
 ```
 
 ### Operation mode map
