@@ -18,6 +18,7 @@ and (b) relinquish control if the user manually intervenes during a dry cycle.
 
 import { AirConditioner } from './airConditioner';
 import { AppConfig, OperationMode } from './config';
+import { HeatPumpState } from './heatPumpState';
 
 type Phase = 'MONITORING' | 'DRYING';
 
@@ -45,6 +46,11 @@ interface Snapshot {
     mode: number;
 }
 
+function describeSnap(snap: Snapshot): string {
+    const mode = OperationMode[snap.mode] ?? String(snap.mode);
+    return snap.power ? mode : `off(${mode})`;
+}
+
 function isCoolOrDry(mode: number): boolean {
     return mode === OperationMode.Cool || mode === OperationMode.Dry;
 }
@@ -55,6 +61,18 @@ export class AirConditionerMonitor {
     // Epoch ms at which the current continuous COOL/DRY run began (null when not in COOL/DRY).
     private coolRunStartAt: number | null = null;
     private dry: DryCycle | null = null;
+    // Set once we've seen the unit sitting in FAN that we did not put there. A user choosing FAN
+    // is an explicit instruction to leave the unit alone, so it suppresses the periodic trigger.
+    private manualFan = false;
+    // Epoch ms at which the periodic threshold was first crossed (null when not armed). See
+    // confirmWindowMs() for why crossing the threshold does not fire a cycle on its own.
+    private armedAt: number | null = null;
+    // FAN readings before this instant are the lagging tail of our own dry cycle, not a user action.
+    private selfFanUntil = 0;
+    // Last state observed, used only by the transition audit below.
+    private lastSeen: Snapshot | null = null;
+    // Observations before this instant may still be echoing a write we made ourselves.
+    private ourWriteUntil = 0;
 
     // Re-entrancy guard: a tick's I/O can outlast the poll interval, and setInterval does not
     // wait for the previous callback. Without this, overlapping ticks could double-fire commands.
@@ -123,6 +141,8 @@ export class AirConditionerMonitor {
                     `mode=${OperationMode[snap.mode] ?? snap.mode} room=${state.RoomTemperature} outdoor=${state.OutdoorTemperature}`,
             );
 
+            this.auditTransition(now, snap, state);
+
             if (this.phase === 'DRYING') {
                 await this.tickDrying(now, snap);
             } else {
@@ -175,11 +195,14 @@ export class AirConditionerMonitor {
                 console.warn(`[${this.ac.label}] dry cycle completion command failed — retrying next tick.`);
                 return;
             }
+            this.ourWriteUntil = now + this.confirmWindowMs();
             this.endDryCycle(now, snap);
         }
     }
 
     private async tickMonitoring(now: number, snap: Snapshot, inCoolDry: boolean): Promise<void> {
+        this.trackManualFan(now, snap);
+
         // Track how long we've been continuously cooling/drying.
         if (inCoolDry) {
             if (this.coolRunStartAt === null) {
@@ -190,13 +213,25 @@ export class AirConditionerMonitor {
         }
 
         // Periodic: long continuous COOL/DRY run → interrupt with a FAN cycle, then resume.
-        if (
+        const due =
             this.periodicEnabled &&
             inCoolDry &&
+            !this.manualFan &&
             this.coolRunStartAt !== null &&
-            now - this.coolRunStartAt >= this.config.maxCoolRunMs
-        ) {
-            console.log(`[${this.ac.label}] COOL/DRY ran >= ${this.config.maxCoolRunMs}ms → starting periodic dry cycle.`);
+            now - this.coolRunStartAt >= this.config.maxCoolRunMs;
+
+        if (!due) {
+            // Left COOL/DRY (or the user took FAN) before the window elapsed.
+            this.armedAt = null;
+        } else if (this.armedAt === null) {
+            this.armedAt = now;
+            console.log(
+                `[${this.ac.label}] COOL/DRY ran >= ${this.config.maxCoolRunMs}ms → ` +
+                    `confirming for ${this.confirmWindowMs()}ms before starting a dry cycle.`,
+            );
+        } else if (now - this.armedAt >= this.confirmWindowMs()) {
+            console.log(`[${this.ac.label}] still COOL/DRY after confirmation window → starting periodic dry cycle.`);
+            // `armedAt` is cleared by endDryCycle, so a failed start simply retries on the next tick.
             await this.startDryCycle(now, 'periodic', snap.mode, { OperationMode: OperationMode.Fan });
             return;
         }
@@ -217,6 +252,38 @@ export class AirConditionerMonitor {
         this.prev = snap;
     }
 
+    // Logs every observed power/mode transition and whether we asked for it
+    private auditTransition(now: number, snap: Snapshot, state: HeatPumpState): void {
+        const before = this.lastSeen;
+        this.lastSeen = snap;
+        if (before === null || (before.power === snap.power && before.mode === snap.mode)) {
+            return;
+        }
+        const origin = now < this.ourWriteUntil ? 'ours' : 'EXTERNAL';
+        console.log(
+            `[${this.ac.label}] MODE CHANGE ${describeSnap(before)} -> ${describeSnap(snap)} (${origin}) ` +
+                `EffectiveFlags=${state.EffectiveFlags} LastEffectiveFlags=${state.LastEffectiveFlags} ` +
+                `FanSpeed=${state.FanSpeed} SetTemperature=${state.SetTemperature}`,
+        );
+    }
+
+    // the user put this unit in FAN, leave it there
+    private trackManualFan(now: number, snap: Snapshot): void {
+        const inFan = snap.power && snap.mode === OperationMode.Fan;
+        if (inFan) {
+            if (!this.manualFan && now >= this.selfFanUntil) {
+                console.log(`[${this.ac.label}] FAN set outside our control — holding off until the mode changes.`);
+                this.manualFan = true;
+            }
+        } else if (this.manualFan) {
+            console.log(
+                `[${this.ac.label}] manual FAN ended (now ${OperationMode[snap.mode] ?? snap.mode}, ` +
+                    `power=${snap.power}) — resuming normal monitoring.`,
+            );
+            this.manualFan = false;
+        }
+    }
+
     private async startDryCycle(
         now: number,
         reason: DryReason,
@@ -231,6 +298,7 @@ export class AirConditionerMonitor {
             console.warn(`[${this.ac.label}] failed to start ${reason} dry cycle — retrying next tick.`);
             return;
         }
+        this.ourWriteUntil = now + this.confirmWindowMs();
         this.phase = 'DRYING';
         this.coolRunStartAt = null;
         this.dry = {
@@ -250,6 +318,10 @@ export class AirConditionerMonitor {
         this.dry = null;
         // Restart run-tracking from a clean slate; the next tick re-derives it from the live state.
         this.coolRunStartAt = null;
+        this.armedAt = null;
+        // Our own FAN will keep coming back from the cache for a while yet; don't read it as the user.
+        this.manualFan = false;
+        this.selfFanUntil = now + this.confirmWindowMs();
         this.prev = snap;
     }
 
@@ -258,5 +330,10 @@ export class AirConditionerMonitor {
     // minutes, so this floor is deliberately generous to avoid aborting a command that did land.
     private settleGraceMs(): number {
         return Math.max(this.config.pollIntervalMs * 3, 300000);
+    }
+
+    // How long the unit must keep reading COOL/DRY after crossing maxCoolRunMs before we act on it.
+    private confirmWindowMs(): number {
+        return Math.max(this.config.pollIntervalMs * 3, 180000);
     }
 }
