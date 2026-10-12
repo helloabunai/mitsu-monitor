@@ -66,6 +66,9 @@ All configuration is via environment variables (see `.env.example`):
 | `POLL_INTERVAL_MS` | no | `60000` | How often each device is polled |
 | `FAN_SPEED` | no | (untouched) | Fixed fan speed during the dry cycle (0=Auto, 1-6) |
 | `DRY_RUN` | no | `false` | Log the actions that *would* be taken without POSTing |
+| `FAN_SPEED_API_PORT` | no | (disabled) | Serve the fan speed API (for Siri/Shortcuts) on this port (see below) |
+| `FAN_SPEED_API_TOKEN` | if `FAN_SPEED_API_PORT` set | – | Bearer token the API requires (min 16 chars) |
+| `FAN_SPEED_API_DEVICE` | if `FAN_SPEED_API_PORT` set | – | Label of the one unit whose fan speed the API sets (e.g. the downstairs unit) |
 
 > **Note:** `DRY_RUN` must be `false` (or unset) for the monitor to actually drive the units. When `true` it only logs state changes, doesn't send actual API reqs. Used for testing.
 
@@ -110,6 +113,8 @@ sudo docker run -d --name mitsu-monitor \
 sudo docker logs -f mitsu-monitor
 ```
 
+If `FAN_SPEED_API_PORT` is set, also publish it on the `docker run` line, e.g. `-p 8080:8080`. Without the fan speed API the container needs no inbound ports.
+
 ### Operation mode map
 
 |   OperationMode  | Meaning |
@@ -120,3 +125,26 @@ sudo docker logs -f mitsu-monitor
 | 7                | Fan     |
 | 8                | Auto    |
 
+## Siri / Apple Shortcuts (fan speed)
+
+I only use this to switch the downstairs unit's fan between low and high while it's heating cos getting the remote or app is too much effort apparently and automations aren't flexible enough, so it's deliberately single-purpose. Setting `FAN_SPEED_API_PORT`, `FAN_SPEED_API_TOKEN` and `FAN_SPEED_API_DEVICE` (the downstairs unit's label) starts a small HTTP fan speed API alongside the monitor:
+
+```
+curl -X POST http://<nas-ip>:8080/fan-speed \
+  -H "Authorization: Bearer $FAN_SPEED_API_TOKEN" -d '{"speed": 3}'
+```
+
+### Siri shortcuts so i can be lazy and call it from my watch or something
+
+e.g. named `Fan speed low`
+
+`Fan speed low` => speed 3 apple shortcut thingy:
+
+1. Get contents of URL: `http://<nas-ip>:8080/fan-speed`. Show MOre: Method `POST`; Header `Authorization` = `Bearer <token>`; Request Body `JSON`, add a Number field `speed` = `3`.
+2. Show content: `Contents of URL`
+
+Do same for Fan speed high except number is 5 baby
+
+### Remote access
+
+tailscale or reverse https proxy or something bro

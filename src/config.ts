@@ -25,6 +25,12 @@ export interface DeviceConfig {
     port: number;
 }
 
+export interface FanSpeedApiConfig {
+    port: number;
+    token: string;
+    device: string;
+}
+
 export interface AppConfig {
     host: string;
     devices: DeviceConfig[];
@@ -41,6 +47,8 @@ export interface AppConfig {
     fanSpeed?: number;
     // When true, never POST to the device: log the action that *would* be taken instead. Useful for testing.
     dryRun: boolean;
+    // Optional HTTP API for setting one unit's fan speed (used by Apple Shortcuts / Siri). Disabled unless FAN_SPEED_API_PORT is set.
+    fanSpeedApi?: FanSpeedApiConfig;
 }
 
 function requireEnv(name: string): string {
@@ -137,6 +145,26 @@ function parseDevices(): DeviceConfig[] {
     return devices;
 }
 
+function parseFanSpeedApi(devices: DeviceConfig[]): FanSpeedApiConfig | undefined {
+    const portRaw = process.env.FAN_SPEED_API_PORT;
+    if (portRaw === undefined || portRaw.trim() === '') {
+        return undefined;
+    }
+    const port = Number(portRaw);
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+        throw new Error(`FAN_SPEED_API_PORT must be a valid port number, got: ${portRaw}`);
+    }
+    const token = requireEnv('FAN_SPEED_API_TOKEN');
+    if (token.length < 16) {
+        throw new Error('FAN_SPEED_API_TOKEN must be at least 16 characters');
+    }
+    const device = requireEnv('FAN_SPEED_API_DEVICE');
+    if (!devices.some((d) => d.label === device)) {
+        throw new Error(`FAN_SPEED_API_DEVICE "${device}" is not a configured device (have: ${devices.map((d) => d.label).join(', ')})`);
+    }
+    return { port, token, device };
+}
+
 export function loadConfig(): AppConfig {
     const fanSpeedRaw = process.env.FAN_SPEED;
     let fanSpeed: number | undefined;
@@ -148,9 +176,10 @@ export function loadConfig(): AppConfig {
         fanSpeed = value;
     }
 
+    const devices = parseDevices();
     return {
         host: requireEnv('HOMEBRIDGE_ADDRESS'),
-        devices: parseDevices(),
+        devices,
         strategy: parseStrategy(process.env.DRY_STRATEGY),
         fanDryDurationMs: parseIntEnv('FAN_DRY_DURATION_MS', 15 * 60 * 1000),
         maxCoolRunMs: parseIntEnv('MAX_COOL_RUN_HOURS', 2) * 60 * 60 * 1000,
@@ -158,5 +187,6 @@ export function loadConfig(): AppConfig {
         statePath: (process.env.STATE_PATH ?? 'state').trim().replace(/^\//, ''),
         fanSpeed,
         dryRun: parseBoolEnv('DRY_RUN', false),
+        fanSpeedApi: parseFanSpeedApi(devices),
     };
 }

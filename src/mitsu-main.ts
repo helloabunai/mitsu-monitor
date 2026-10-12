@@ -15,6 +15,7 @@ import * as dotenv from 'dotenv';
 
 import { AirConditioner } from './airConditioner';
 import { AppConfig, loadConfig } from './config';
+import { startFanSpeedApi } from './fanSpeedApi';
 import { AirConditionerMonitor } from './monitor';
 
 // Prefer a local override file if present, otherwise fall back to process env / .env.
@@ -36,6 +37,7 @@ function main(): void {
 
     console.log(`mitsu-monitor starting: ${config.devices.length} device(s) on ${config.host}`);
 
+    const units = new Map<string, AirConditioner>();
     const monitors = config.devices.map((device) => {
         const ac = new AirConditioner({
             label: device.label,
@@ -44,10 +46,14 @@ function main(): void {
             statePath: config.statePath,
             dryRun: config.dryRun,
         });
+        units.set(device.label, ac);
         const monitor = new AirConditionerMonitor(ac, config);
         monitor.start();
         return monitor;
     });
+
+    const fanSpeedUnit = config.fanSpeedApi && units.get(config.fanSpeedApi.device);
+    const fanSpeedApi = config.fanSpeedApi && fanSpeedUnit ? startFanSpeedApi(config.fanSpeedApi, fanSpeedUnit) : null;
 
     // Finalize any in-flight dry cycle on exit so we never leave a unit parked in FAN.
     let shuttingDown = false;
@@ -57,6 +63,7 @@ function main(): void {
         }
         shuttingDown = true;
         console.log(`Received ${signal} — shutting down ${monitors.length} monitor(s)...`);
+        fanSpeedApi?.close();
         await Promise.allSettled(monitors.map((m) => m.shutdown()));
         process.exit(0);
     };
